@@ -1,0 +1,39 @@
+# LADI Data Pipeline Configuration
+
+crawl:
+  urls_file: data/LA_urls.csv
+  name_col: Name
+  url_col: URL
+  output_dir: data/results
+  state_dir: data/state
+  aiohttp_concurrency: 750
+  playwright_tabs: 30
+  extract_text: true
+  extraction_concurrency: 300
+
+summarise:
+  model: gpt-4.1-mini          # primary model (100K TPM)
+  fallback_models:             # round-robin for throughput
+    - gpt-4.1-mini
+    - gpt-5-mini
+    - gpt-4.1
+  max_input_tokens: 1500       # truncate long docs to save TPM
+  min_words: 100               # skip docs below this threshold
+  batch_size: 50               # requests per batch API call
+  output_file: data/summaries.jsonl
+
+embed:
+  model: text-embedding-3-large
+  input_field: summary         # embed the summary, not full text
+  batch_size: 100
+  output_file: data/embeddings.jsonl
+
+database:
+  host: localhost
+  port: 5432
+  name: ladi
+  table: documents
+
+apim:
+  endpoint: ""                 # Azure APIM endpoint
+  api_key: ""                  # set via APIM_API_KEY env var
