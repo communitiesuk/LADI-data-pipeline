@@ -2,7 +2,7 @@
 Stage 2: Summarise and classify documents using GPT via Azure APIM.
 
 For each document with ≥100 words, calls GPT to extract:
-  title, year, summary, themes, document_type, confidence
+  title, year, summary, themes (1-2)
 
 Output: JSONL (one JSON object per line, appended incrementally).
 Supports checkpoint/resume — already-processed URLs are skipped on restart.
@@ -12,12 +12,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
 import pandas as pd
 import yaml
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,30 +31,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 THEMES = [
-    'finance', 'planning', 'housing', 'transport', 'environment',
-    'education', 'health', 'social_care', 'children_services',
-    'economic_development', 'governance', 'waste', 'leisure', 'digital', 'other',
+    "Advice and benefits",
+    "Adult social care",
+    "Business and employment",
+    "Community safety",
+    "Council and democracy",
+    "Children and young families",
+    "Education",
+    "Environment and waste",
+    "Housing",
+    "Leisure and culture",
+    "Local government finance",
+    "People and communities",
+    "Planning and development",
+    "Public health",
+    "Transport and highways",
+    "Uncategorised",
 ]
 
-DOC_TYPES = [
-    'Local Plan', 'Infrastructure Funding Statement', 'Medium Term Financial Strategy',
-    'Annual Report', 'Statement of Accounts', 'Budget', 'Corporate Plan',
-    'Sustainability Appraisal', 'Housing Needs Assessment', 'Transport Plan',
-    'Climate Action Plan', 'Equality Impact Assessment', 'Asset Management Plan',
-    'Community Infrastructure Levy', 'Neighbourhood Plan', 'other',
-]
+SYSTEM_PROMPT = f"""You extract metadata from UK local authority documents.
 
-SYSTEM_PROMPT = (
-    "You are a metadata extractor for UK local authority documents.\n"
-    "Given document text, return JSON with exactly these fields:\n"
-    "- title: string (document title; infer from content if not stated)\n"
-    "- year: integer or null (publication year; null if unknown)\n"
-    "- summary: string (2-3 sentences describing purpose and key content)\n"
-    f"- themes: array of 1-3 strings from: {', '.join(THEMES)}\n"
-    f"- document_type: string, one of: {', '.join(DOC_TYPES)}\n"
-    "- confidence: float 0.0-1.0 (how confident you are in the classification)\n\n"
-    "Respond with valid JSON only. No markdown fences."
-)
+Given document text, return JSON with exactly these fields:
+- title: string (document title; infer from content if not stated)
+- year: integer or null (publication year; null if unknown)
+- summary: string (2-3 sentences describing purpose and key content, suitable for search)
+- themes: array of 1-2 themes from the list below
+
+Only give 2 themes if the document genuinely fits both — not just because it mentions a related topic. For example, a referendum on a neighbourhood plan is both "Council and democracy" and "Planning and development" because it is genuinely a democratic process about a planning matter.
+
+Themes:
+{chr(10).join(f'- {t}' for t in THEMES)}
+
+Respond with valid JSON only. No markdown fences."""
 
 # CSV column names from crawldocs output
 URL_COL = 'Document Link'
@@ -58,18 +70,33 @@ TEXT_COL = 'text'
 AUTH_COL = 'Authority Name'
 
 
+def clean_text(text: str) -> str:
+    """Strip invisible control characters that cause APIM 403s."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+
+
+def truncate_words(text: str, max_words: int = 600) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def truncate_text(text: str, max_chars: int) -> str:
-    """Truncate to approximately max_chars, cutting at a word boundary."""
-    if len(text) <= max_chars:
-        return text
-    cut = text[:max_chars]
-    boundary = cut.rfind(' ')
-    return cut[:boundary] if boundary > max_chars * 0.8 else cut
+def build_client() -> AsyncOpenAI:
+    from ladi.apim import _get_token
+    return AsyncOpenAI(
+        base_url=os.environ["LADI_APIM_BASE_URL"],
+        api_key=_get_token(),
+        default_headers={"Ocp-Apim-Subscription-Key": os.environ["LADI_APIM_SUBSCRIPTION_KEY"]},
+        default_query={"api-version": os.environ["LADI_APIM_API_VERSION"]},
+        max_retries=0,
+        timeout=30.0,
+    )
 
 
 def load_checkpoint(output_path: Path) -> set:
@@ -87,44 +114,34 @@ def load_checkpoint(output_path: Path) -> set:
                 if 'url' in obj:
                     done.add(obj['url'])
             except json.JSONDecodeError:
-                pass  # skip malformed lines (e.g. truncated on crash)
+                pass
     if done:
         logger.info(f"Checkpoint: {len(done):,} already processed — resuming")
     return done
 
 
-async def call_api(
-    client: AsyncOpenAI,
-    model: str,
-    url: str,
-    authority: str,
-    text: str,
-    max_chars: int,
-) -> dict:
-    truncated = truncate_text(text, max_chars)
-    user_content = f"Authority: {authority}\nURL: {url}\n\n{truncated}"
+async def call_api(client: AsyncOpenAI, url: str, authority: str, text: str) -> dict:
+    cleaned = clean_text(truncate_words(text))
+    user_content = f"URL: {url}\n\n{cleaned}"
 
     resp = await client.chat.completions.create(
-        model=model,
+        model="gpt-4-1",
         messages=[
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user', 'content': user_content},
         ],
         response_format={'type': 'json_object'},
         temperature=0.0,
-        max_tokens=400,
+        max_tokens=300,
     )
     result = json.loads(resp.choices[0].message.content)
-    result.update({'url': url, 'authority': authority, 'model': model})
+    result.update({'url': url, 'authority': authority})
     return result
 
 
 async def worker(
     queue: asyncio.Queue,
     client: AsyncOpenAI,
-    models: list,
-    model_idx: list,  # single-element list used as mutable counter
-    max_chars: int,
     out_fh,
     counters: dict,
 ) -> None:
@@ -135,17 +152,28 @@ async def worker(
             break
 
         url, authority, text = item
-        model = models[model_idx[0] % len(models)]
-        model_idx[0] += 1
 
         try:
-            result = await call_api(client, model, url, authority, text, max_chars)
+            result = await call_api(client, url, authority, text)
             out_fh.write(json.dumps(result) + '\n')
             out_fh.flush()
             counters['done'] += 1
         except Exception as e:
-            counters['errors'] += 1
-            logger.warning(f"[{url[:80]}] {type(e).__name__}: {e}")
+            if "429" in str(e):
+                counters['rate_limits'] += 1
+                logger.warning(f"Rate limited — waiting 60s...")
+                await asyncio.sleep(60)
+                try:
+                    result = await call_api(client, url, authority, text)
+                    out_fh.write(json.dumps(result) + '\n')
+                    out_fh.flush()
+                    counters['done'] += 1
+                except Exception as e2:
+                    counters['errors'] += 1
+                    logger.warning(f"[{url[:80]}] retry failed: {e2}")
+            else:
+                counters['errors'] += 1
+                logger.warning(f"[{url[:80]}] {type(e).__name__}: {e}")
 
         queue.task_done()
 
@@ -163,6 +191,7 @@ async def stats_loop(counters: dict, total: int, interval: int = 60) -> None:
             eta = f"{remaining / rate:.0f} min" if rate > 0 else "unknown"
             logger.info(
                 f"Progress: {done:,}/{total:,} done | {errors:,} errors | "
+                f"{counters['rate_limits']} rate limits | "
                 f"{rate:.0f} docs/min | ETA {eta}"
             )
     except asyncio.CancelledError:
@@ -171,24 +200,12 @@ async def stats_loop(counters: dict, total: int, interval: int = 60) -> None:
 
 async def run(cfg: dict, input_csv: str, output_file: str, concurrency: int) -> None:
     sum_cfg = cfg['summarise']
-    apim_cfg = cfg['apim']
-
-    models: list = sum_cfg.get('fallback_models') or [sum_cfg['model']]
-    # ~4 chars per token for a rough but dependency-free truncation
-    max_chars: int = sum_cfg.get('max_input_tokens', 1500) * 4
     min_words: int = sum_cfg.get('min_words', 100)
 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    api_key = os.environ.get('APIM_API_KEY') or apim_cfg.get('api_key') or 'placeholder'
-    endpoint = os.environ.get('APIM_ENDPOINT') or apim_cfg.get('endpoint')
-    if not endpoint:
-        raise ValueError(
-            "APIM endpoint not set. Provide via config apim.endpoint or APIM_ENDPOINT env var."
-        )
-
-    client = AsyncOpenAI(base_url=endpoint, api_key=api_key)
+    client = build_client()
     done_urls = load_checkpoint(output_path)
 
     logger.info(f"Loading {input_csv} ...")
@@ -208,26 +225,20 @@ async def run(cfg: dict, input_csv: str, output_file: str, concurrency: int) -> 
         logger.info("Nothing to do.")
         return
 
-    counters: dict = {'done': 0, 'errors': 0}
-    model_idx: list = [0]  # mutable round-robin counter, safe in single-threaded asyncio
+    counters: dict = {'done': 0, 'errors': 0, 'rate_limits': 0}
 
-    # Queue with backpressure so we don't hold all rows in memory
     queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
 
     with open(output_path, 'a') as out_fh:
         worker_tasks = [
-            asyncio.create_task(
-                worker(queue, client, models, model_idx, max_chars, out_fh, counters)
-            )
+            asyncio.create_task(worker(queue, client, out_fh, counters))
             for _ in range(concurrency)
         ]
         stats_task = asyncio.create_task(stats_loop(counters, total))
 
-        # Feed queue; await blocks when full, yielding to workers
         for _, row in df.iterrows():
             await queue.put((row[URL_COL], str(row.get(AUTH_COL, '')), row[TEXT_COL]))
 
-        # Poison pills to stop each worker
         for _ in range(concurrency):
             await queue.put(None)
 
@@ -263,8 +274,8 @@ def main():
                    help='Input CSV path (default: latest CSV in crawl output_dir)')
     p.add_argument('--output', default=None,
                    help='Output JSONL path (default: from config summarise.output_file)')
-    p.add_argument('--concurrency', type=int, default=20,
-                   help='Concurrent API requests (default: 20)')
+    p.add_argument('--concurrency', type=int, default=10,
+                   help='Concurrent API requests (default: 10)')
     args = p.parse_args()
 
     cfg = load_config(args.config)
