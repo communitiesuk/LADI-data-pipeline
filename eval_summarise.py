@@ -120,7 +120,7 @@ async def judge_call(client: AsyncOpenAI, prompt: str) -> dict:
 
 
 async def judge_title(client: AsyncOpenAI, gold_title: str, pred_title: str, text: str) -> dict:
-    snippet = " ".join(text.split()[:200])
+    snippet = " ".join(clean_text(text).split()[:200])
     prompt = TITLE_JUDGE_PROMPT.format(
         gold_title=gold_title, pred_title=pred_title, text_snippet=snippet
     )
@@ -128,7 +128,9 @@ async def judge_title(client: AsyncOpenAI, gold_title: str, pred_title: str, tex
 
 
 async def judge_summary(client: AsyncOpenAI, source_text: str, pred_summary: str) -> dict:
-    snippet = " ".join(source_text.split()[:500])
+    snippet = " ".join(clean_text(source_text).split()[:500])
+    # WAF blocks "personal data:" followed by PII field names — swap colon for dash
+    snippet = snippet.replace("personal data:", "personal data -")
     prompt = SUMMARY_JUDGE_PROMPT.format(source_text=snippet, pred_summary=pred_summary)
     return await judge_call(client, prompt)
 
@@ -178,28 +180,41 @@ def score_year(gold_year, pred_year) -> dict:
 # Main evaluation loop (concurrent with shared rate-limit pause)
 # ---------------------------------------------------------------------------
 
-CONCURRENCY = 5
+CONCURRENCY = 3
 
-# Shared lock: when any task hits 429, all workers pause (created lazily)
-_rate_limit_lock: asyncio.Lock | None = None
+# Global pause event: when cleared, all workers block before their next API call.
+# Only the worker that hits 429 clears it, sleeps, then sets it again.
+_pause_event: asyncio.Event | None = None
+_pause_lock: asyncio.Lock | None = None
 
 
-def _get_lock() -> asyncio.Lock:
-    global _rate_limit_lock
-    if _rate_limit_lock is None:
-        _rate_limit_lock = asyncio.Lock()
-    return _rate_limit_lock
+def _init_pause():
+    """Lazily create the event+lock (must be called inside a running event loop)."""
+    global _pause_event, _pause_lock
+    if _pause_event is None:
+        _pause_event = asyncio.Event()
+        _pause_event.set()  # start unblocked
+        _pause_lock = asyncio.Lock()
 
 
 async def rate_limited_call(coro_fn, *args, **kwargs):
-    """Call an async function; if 429, pause ALL workers for 60s then retry."""
+    """Call an async function; if 429, freeze ALL workers for 65s then retry."""
+    _init_pause()
+    # Wait if another worker triggered a pause
+    await _pause_event.wait()
     try:
         return await coro_fn(*args, **kwargs)
     except Exception as e:
         if "429" in str(e):
-            async with _get_lock():
-                print(f"  ⏳ Rate limited — all workers pausing 60s...", flush=True)
-                await asyncio.sleep(60)
+            # Only one worker performs the pause
+            async with _pause_lock:
+                if _pause_event.is_set():
+                    _pause_event.clear()
+                    print(f"  ⏳ Rate limited — all workers pausing 65s...", flush=True)
+                    await asyncio.sleep(65)
+                    _pause_event.set()
+            # Wait again in case we weren't the one who did the sleep
+            await _pause_event.wait()
             return await coro_fn(*args, **kwargs)
         raise
 

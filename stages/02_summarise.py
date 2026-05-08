@@ -57,7 +57,7 @@ Given document text, return JSON with exactly these fields:
 - summary: string (2-3 sentences describing purpose and key content, suitable for search)
 - themes: array of 1-2 themes from the list below
 
-Only give 2 themes if the document genuinely fits both — not just because it mentions a related topic. For example, a referendum on a neighbourhood plan is both "Council and democracy" and "Planning and development" because it is genuinely a democratic process about a planning matter.
+Only give 2 themes if the document genuinely fits both. E.g, a referendum on a neighbourhood plan is both "Council and democracy" and "Planning and development".
 
 Themes:
 {chr(10).join(f'- {t}' for t in THEMES)}
@@ -122,7 +122,7 @@ def load_checkpoint(output_path: Path) -> set:
 
 async def call_api(client: AsyncOpenAI, url: str, authority: str, text: str) -> dict:
     cleaned = clean_text(truncate_words(text))
-    user_content = f"URL: {url}\n\n{cleaned}"
+    user_content = f"Authority: {authority}\nURL: {url}\n\n{cleaned}"
 
     resp = await client.chat.completions.create(
         model="gpt-4-1",
