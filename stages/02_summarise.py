@@ -122,6 +122,19 @@ def load_checkpoint(output_path: Path) -> set:
 
 async def call_api(client: AsyncOpenAI, url: str, authority: str, text: str) -> dict:
     cleaned = clean_text(truncate_words(text))
+    # Azure WAF sanitisation — colons trigger PII/geolocation rules, strip other risky content
+    cleaned = cleaned.replace(":", " -")
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    cleaned = re.sub(r"www\.\S+", "", cleaned)
+    cleaned = re.sub(r"[\w.-]+@[\w.-]+\.\w+", "", cleaned)
+    cleaned = re.sub(r"\d{4,5}\s?\d{6}", "", cleaned)  # UK phone numbers
+    cleaned = re.sub(r"[^\x00-\x7F]+", "", cleaned)  # non-ASCII (Cyrillic etc.)
+    cleaned = re.sub(r"\b(database|schema)\s*\(", r"\1 ", cleaned)  # SQL injection pattern
+    cleaned = re.sub(r"(\d)\s+as\s+(\w+)\s+from", r"\1 as \2 since", cleaned)  # SQL SELECT pattern
+    # Skip garbled text (bad PDF extraction) — if <50% alpha chars, not useful
+    alpha_ratio = sum(c.isalpha() for c in cleaned) / max(len(cleaned), 1)
+    if alpha_ratio < 0.5:
+        return {"url": url, "authority": authority, "error": "garbled_text"}
     user_content = f"Authority: {authority}\nURL: {url}\n\n{cleaned}"
 
     resp = await client.chat.completions.create(

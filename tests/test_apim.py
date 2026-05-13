@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ladi.apim import _get_token, build_client
+from ladi.apim import _get_token, build_client, build_embedding_client
 
 
 # ---------------------------------------------------------------------------
@@ -72,5 +72,28 @@ def test_build_client_sets_subscription_header(apim_env):
     """build_client sets Ocp-Apim-Subscription-Key in default headers."""
     with patch("ladi.apim._get_token", return_value="fake-token"):
         client = build_client()
+
+    assert client.default_headers.get("Ocp-Apim-Subscription-Key") == "fake-sub-key"
+
+
+# ---------------------------------------------------------------------------
+# build_embedding_client
+# ---------------------------------------------------------------------------
+
+def test_build_embedding_client_returns_async_openai(apim_env):
+    """build_embedding_client returns AsyncOpenAI with embedding base URL."""
+    from openai import AsyncOpenAI
+
+    with patch("ladi.apim._get_token", return_value="fake-token"):
+        client = build_embedding_client()
+
+    assert isinstance(client, AsyncOpenAI)
+    assert str(client.base_url).rstrip("/") == "https://apim.example.com/embeddings"
+
+
+def test_build_embedding_client_sets_subscription_header(apim_env):
+    """build_embedding_client sets Ocp-Apim-Subscription-Key in default headers."""
+    with patch("ladi.apim._get_token", return_value="fake-token"):
+        client = build_embedding_client()
 
     assert client.default_headers.get("Ocp-Apim-Subscription-Key") == "fake-sub-key"
