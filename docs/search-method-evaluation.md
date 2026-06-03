@@ -323,16 +323,77 @@ Queries like "how much was spent on highways" and "how was homelessness tackled"
 
 ## Recommendation
 
-For the LADI search system:
+### What to search against
 
-**Primary: Embedding search via pgvector** — best overall performance across all query types. The `<=>` cosine distance operator in Postgres makes this efficient at scale — no need to load embeddings into application memory. Handles both structured document-type queries and free-form natural language.
+**Embed the GPT summary, not the full document text.** The summary is a clean, noise-free semantic representation of the whole document. Embedding full text or chunking into fixed-size passages adds complexity without improving results — for a system where the unit of retrieval is a document, not a passage, summary embedding is both simpler and more accurate.
 
-**Secondary: Summary keyword** — useful as a no-API fallback (no embedding call needed) or for adding boosting signals. Can be combined with embedding via a hybrid score: `embedding_score * 0.8 + summary_keyword_score * 0.2`.
+---
 
-**Avoid: Full text keyword as a primary search method** — too noisy given the volume and variety of LA documents. Could be retained only for exact-phrase matching on known document identifiers (e.g. a specific reference number or agenda item).
+### Primary retrieval
 
-A recommended production approach:
-1. Embed the query (one APIM call per search)
-2. Retrieve top-20 by pgvector cosine similarity
-3. Re-rank or boost results where the summary also keyword-matches
-4. Apply any SQL filters (authority, year, theme) alongside the vector query
+**pgvector cosine similarity on the summary embedding.**
+
+Embed the user's semantic query and rank all documents by `<=>` cosine distance in Postgres. This is the only method that reliably handles natural language questions ("how was homelessness tackled"), understands synonyms ("mitigations" for "savings"), and works consistently across all query types. All other methods are supplementary to this.
+
+---
+
+### Structured filters
+
+**SQL `WHERE` clauses for explicit user constraints only.**
+
+In a chatbot interface, the LLM extracts explicit constraints from the user message (authority, year) and applies them as SQL filters alongside the vector query:
+
+```sql
+SELECT title, authority, 1 - (embedding <=> query_vec) AS similarity
+FROM documents
+WHERE authority ILIKE '%Manchester%'   -- only if user said so
+AND year >= '2024'                     -- only if user said so
+ORDER BY embedding <=> query_vec
+LIMIT 10
+```
+
+The key principle: **only apply filters the user explicitly stated, not ones inferred from context.** If a user asks "housing strategy documents", don't filter by the Housing theme — use the phrase as the embedding query. The embedding handles semantic intent; SQL handles metadata constraints. Themes are most valuable for explicit user-driven filtering ("only show housing documents") and browsing the corpus by category, not as an automatic pre-filter.
+
+If filtered results return fewer than 3 documents, widen or drop the filter and inform the user — metadata quality (year ~95% accurate, themes ~88% accurate) means aggressive filtering can silently drop relevant documents.
+
+---
+
+### Optional secondary boost
+
+**Summary keyword match as a lightweight re-ranking signal.**
+
+For exact document-type queries ("infrastructure funding statement"), a summary keyword score provides a small precision lift. It is not a co-equal retrieval input — just a boost applied after embedding retrieval:
+
+```
+final_score = 0.85 × embedding_similarity + 0.15 × summary_keyword_score
+```
+
+**Do not use full document text for keyword matching.** It is the worst performer across all queries, returning committee minutes, forward plans, and fire service reports for finance or housing queries simply because the words appear incidentally in long documents.
+
+---
+
+### Index
+
+| Scale | Recommendation |
+|-------|---------------|
+| Now (1,430 docs) | No index needed — full scan is near-instant |
+| Full corpus (773K docs) | **HNSW** (`vector_cosine_ops`) — better recall than IVFFlat, handles incremental inserts without rebuilding, lower tuning burden despite higher memory usage |
+
+IVFFlat is simpler to build but requires careful tuning of `lists` and `probes` parameters, and recall degrades as documents are added between index rebuilds. At 773K documents being loaded incrementally, HNSW is the more robust choice.
+
+---
+
+### What to drop from earlier recommendations
+
+| Component | Verdict |
+|-----------|---------|
+| Fixed-size chunking (250–500 words) | Drop — summary embedding outperforms it for document retrieval |
+| Full-text keyword in the hybrid (tsvector/ts_rank) | Drop — consistently worst performer; degrades fusion results |
+| RRF fusion with full-text keyword | Drop — zero overlap with embedding on natural language queries means fusing adds noise, not signal |
+| IVFFlat index at full scale | Use for MVP only — switch to HNSW before full corpus load |
+
+---
+
+### Summary
+
+Embed the GPT-generated summary for each document. At query time, the LLM extracts a clean semantic query plus any explicit constraints (authority, year, theme) from the user's message. Run the semantic query through pgvector cosine similarity, applying SQL filters only where the user explicitly specified them. Optionally apply a small summary keyword boost for exact document-type queries. Use HNSW indexing at full scale. Keep full document text in the database for display and downstream use, but do not search against it.
