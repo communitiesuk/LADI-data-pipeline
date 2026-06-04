@@ -288,6 +288,48 @@ All 4 methods query Azure Postgres directly. Embedding search embeds the query v
 
 ---
 
+### 8. "section 106"
+
+**Embedding** (pgvector)
+| # | Title | Authority | Similarity |
+|---|-------|-----------|------------|
+| 1 | City of York Council Infrastructure Funding Statement 2019-20 | york.gov.uk | 0.457 |
+| 2 | Summary of the Developer's Main Planning Obligations for the Redevelopment of Barking Riverside | London Borough of Barking and Dagenham | 0.450 |
+| 3 | Section 106 Expenditure: Proposed Cycle Route through Brinton Park | Wyre Forest District Council | 0.404 |
+| 4 | Delegated Decision: Release of Section 106 Funds for Additional Football Equipment in Rothley | Charnwood Borough Council | 0.393 |
+| 5 | Oadby and Wigston Town Centres Area Action Plan: Additional Suggested Change SC56 | Oadby and Wigston Borough Council | 0.387 |
+
+**Full text keyword** (ILIKE on document_text)
+| # | Title | Authority |
+|---|-------|-----------|
+| 1 | Blaby Local Plan Delivery DPD: Main Modifications Habitats Regulations Assessment Addendum | blaby.gov.uk |
+| 2 | Application to Discharge Section 52 Planning Obligation at Penolva, Tresco | Council of the Isles of Scilly |
+| 3 | Constitution of West Oxfordshire District Council Part 4F: Functions in relation to Planning | West Oxfordshire District Council |
+| 4 | Bromsgrove District Council Housing Land Availability Assessment 2021-2022 | Bromsgrove District Council |
+| 5 | South Ribble Borough Council Annual Infrastructure Funding Statement 2024/25 | southribble.moderngov.co.uk |
+
+**Summary keyword** (ILIKE on summary)
+| # | Title | Authority |
+|---|-------|-----------|
+| 1 | City of York Council Infrastructure Funding Statement 2019-20 | york.gov.uk |
+| 2 | Gloucester City Council Annual Infrastructure Funding Statement 2024-25 | gloucester.moderngov.co.uk |
+| 3 | South Ribble Borough Council Annual Infrastructure Funding Statement 2024/25 | southribble.moderngov.co.uk |
+| 4 | Summary of the Developer's Main Planning Obligations for the Redevelopment of Barking Riverside | London Borough of Barking and Dagenham |
+| 5 | Infrastructure Funding Statement – Priorities Report | sevenoaks.moderngov.co.uk |
+
+**Title keyword** (ILIKE on title)
+| # | Title | Authority |
+|---|-------|-----------|
+| 1 | Delegated Decision: Release of Section 106 Funds for Additional Football Equipment in Rothley | Charnwood Borough Council |
+| 2 | Internal Audit Report on Community Infrastructure Levy (CIL) and Section 106 (S106) Phase II Expenditure | London Borough of Barnet |
+| 3 | Housing Services Comments on Section 106A Application for Wellstones Car Park | Watford Borough Council |
+| 4 | Equality Impact Assessment for Section 106 Public Open Space Projects in Filleigh, Witheridge, and Newton Tracey | North Devon Council |
+| 5 | Section 106 Expenditure: Proposed Cycle Route through Brinton Park | Wyre Forest District Council |
+
+> **Verdict:** **Title keyword wins clearly.** "Section 106" is a precise legal term with a consistent naming convention — documents specifically about S106 tend to say so in their title. All 5 title keyword results are documents directly concerned with S106: a fund release decision, a CIL/S106 audit, a housing obligation variation, an equality assessment for S106 projects, and an S106-funded cycle route. Embedding returns a mix — 3 genuinely S106-focused documents but also an IFS (which references S106 as one of many topics) and the Oadby Town Centres Action Plan which has no S106 content in its summary at all. Summary keyword surfaces IFS documents because S106 is mentioned prominently in IFS summaries, but these are not specifically *about* S106. Full text is the worst performer — a Habitats Regulations Assessment, a council constitution, and a housing land availability assessment all surface because "section 106" appears somewhere in lengthy text. This query demonstrates that for precise legal/technical terms with consistent title conventions, title keyword is the strongest method.
+
+---
+
 ## Overall Summary
 
 | Query | Best method | Worst method | Notes |
@@ -299,6 +341,7 @@ All 4 methods query Azure Postgres directly. Embedding search embeds the query v
 | How was homelessness tackled | **Embedding** | Summary / Title | Natural language; keyword returns near-random results |
 | Climate change net zero action plan | **Embedding** | Full text | Finds substance (emissions, pathways) over incidental mentions |
 | School places primary admissions | All reasonable | — | Consistent terminology helps all methods |
+| Section 106 | **Title keyword** | Full text | Precise legal term — title keyword outperforms embedding |
 
 ---
 
@@ -313,11 +356,22 @@ It performs well for both exact document-type queries ("infrastructure funding s
 ### 3. Summary keyword is a viable lightweight fallback
 Because GPT-generated summaries are concise and on-topic, ILIKE matching against them has much higher precision than full text. It performs comparably to embedding for well-defined document type queries but degrades significantly for natural language questions (where question words like "how", "was", "tackled" match unrelated content).
 
-### 4. Title keyword is precise but has low recall
-Works well when the user knows exactly what they're looking for and the document title reflects it. Fails for natural language queries and misses relevant documents with different title conventions. Useful as a secondary signal when combined with other methods.
+### 4. Title keyword is precise but has low recall — except for legal/technical terms
+Works well when the user knows exactly what they're looking for and the document title reflects it. Fails for natural language queries and misses relevant documents with different title conventions. However, for precise legal or technical terms with consistent naming conventions — such as "section 106" — title keyword is the strongest method, outperforming embedding. Documents specifically about S106 tend to say so in their title; embedding diffuses across the broader planning/development semantic space and returns less targeted results.
 
 ### 5. Natural language queries are the definitive differentiator
 Queries like "how much was spent on highways" and "how was homelessness tackled" expose the fundamental limitation of keyword search — it cannot match user intent when the query words don't appear literally in the indexed field. There is **zero overlap** between embedding results and any keyword method for these queries.
+
+### 6. Query type should inform method weighting
+The results suggest three broad query types with different optimal methods:
+
+| Query type | Example | Best method |
+|------------|---------|-------------|
+| Natural language / question | "how was homelessness tackled" | Embedding only |
+| Thematic / conceptual | "housing strategy affordable homes" | Embedding |
+| Precise legal / technical term | "section 106", "infrastructure funding statement" | Title or summary keyword |
+
+A production system should detect query type — or weight methods accordingly — rather than applying a single fixed approach to all queries.
 
 ---
 
