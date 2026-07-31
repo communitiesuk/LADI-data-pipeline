@@ -69,16 +69,16 @@ def upsert_row(cur, table, row):
 
     cur.execute(
         f"""
-        INSERT INTO {table} (url, title, year, summary, themes, authority, document_text, embedding)
+        INSERT INTO {table} (url, title, year, summary, themes, authority, text, embedding)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)
         ON CONFLICT (url) DO UPDATE SET
-            title         = EXCLUDED.title,
-            year          = EXCLUDED.year,
-            summary       = EXCLUDED.summary,
-            themes        = EXCLUDED.themes,
-            authority     = EXCLUDED.authority,
-            document_text = EXCLUDED.document_text,
-            embedding     = EXCLUDED.embedding
+            title     = EXCLUDED.title,
+            year      = EXCLUDED.year,
+            summary   = EXCLUDED.summary,
+            themes    = EXCLUDED.themes,
+            authority = EXCLUDED.authority,
+            text      = EXCLUDED.text,
+            embedding = EXCLUDED.embedding
         """,
         (
             truncate(row.get('url'), 250),
