@@ -114,23 +114,44 @@ def load_summaries(input_path: Path) -> list[dict]:
     return records
 
 
-async def embed_batch(client: AsyncOpenAI, batch: list[dict], input_field: str) -> list[dict]:
-    """Call embeddings API for a batch, return records with embedding added."""
+async def embed_batch(client: AsyncOpenAI, batch: list[dict], input_field: str) -> tuple[list[dict], int]:
+    """Call embeddings API for a batch. Returns (records_with_embedding, prompt_tokens)."""
     texts = [str(r.get(input_field, '')) for r in batch]
     resp = await client.embeddings.create(
         model=MODEL,
         input=texts,
     )
-    return [{**record, "embedding": emb.embedding}
-            for record, emb in zip(batch, resp.data)]
+    prompt_tokens = resp.usage.prompt_tokens if resp.usage else 0
+    return (
+        [{**record, "embedding": emb.embedding} for record, emb in zip(batch, resp.data)],
+        prompt_tokens,
+    )
+
+
+async def token_refresh_loop(client_ref: dict, endpoint: str, interval: int = 2700) -> None:
+    """Refresh the Azure AD token every 45 minutes."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                logger.info("Refreshing Azure AD token ...")
+                async with client_ref['lock']:
+                    client_ref['client'] = build_client(endpoint)
+                    client_ref['last_refreshed'] = time.monotonic()
+                logger.info("Azure AD token refreshed successfully.")
+            except Exception as e:
+                logger.warning(f"Token refresh failed: {e} — will retry next cycle")
+    except asyncio.CancelledError:
+        pass
 
 
 async def worker(
     queue: asyncio.Queue,
-    client: AsyncOpenAI,
+    client_ref: dict,
     out_fh,
     counters: dict,
     input_field: str,
+    endpoint: str,
 ) -> None:
     while True:
         batch = await queue.get()
@@ -145,11 +166,12 @@ async def worker(
                 await asyncio.sleep(wait)
 
             try:
-                results = await embed_batch(client, batch, input_field)
+                results, prompt_tokens = await embed_batch(client_ref['client'], batch, input_field)
                 for r in results:
                     out_fh.write(json.dumps(r) + '\n')
                 out_fh.flush()
                 counters['done'] += len(results)
+                counters['input_tokens'] += prompt_tokens
                 break
             except Exception as e:
                 if "429" in str(e):
@@ -159,6 +181,17 @@ async def worker(
                         counters['backoff_until'] = new_until
                         logger.warning(f"Rate limited — shared backoff {backoff}s")
                     backoff = min(backoff * 2, 300)
+                elif "401" in str(e) or "403" in str(e) or "PermissionDenied" in type(e).__name__:
+                    async with client_ref['lock']:
+                        if time.monotonic() - client_ref['last_refreshed'] > 10:
+                            logger.warning("Auth error — refreshing AD token ...")
+                            try:
+                                client_ref['client'] = build_client(endpoint)
+                                client_ref['last_refreshed'] = time.monotonic()
+                                logger.info("Token refreshed after auth error.")
+                            except Exception as ref_e:
+                                logger.warning(f"Token refresh failed: {ref_e}")
+                    await asyncio.sleep(1)
                 else:
                     counters['errors'] += len(batch)
                     urls = [r.get('url', '')[:60] for r in batch[:3]]
@@ -179,11 +212,14 @@ async def stats_loop(counters: dict, total: int, interval: int = 60) -> None:
             rate = done / elapsed * 60 if elapsed > 0 else 0
             remaining = total - done - errors
             eta = f"{remaining / rate:.0f} min" if rate > 0 else "unknown"
+            in_tok = counters['input_tokens']
+            avg_in = in_tok // done if done else 0
             logger.info(
                 f"Progress: {done:,}/{total:,} done | {errors:,} errors | "
                 f"{counters['rate_limits']} rate limits | "
                 f"{rate:.0f} docs/min | ETA {eta}"
             )
+            logger.info(f"Tokens:   in {in_tok:,} total ({avg_in}/doc)")
     except asyncio.CancelledError:
         pass
 
@@ -200,7 +236,11 @@ async def run(cfg: dict, input_file: str, output_file: str, concurrency: int, en
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
 
-    client = build_client(endpoint)
+    client_ref = {
+        'client': build_client(endpoint),
+        'lock': asyncio.Lock(),
+        'last_refreshed': time.monotonic(),
+    }
     done_urls = load_checkpoint(output_path)
 
     logger.info(f"Loading {input_path} ...")
@@ -219,15 +259,16 @@ async def run(cfg: dict, input_file: str, output_file: str, concurrency: int, en
     batches = [records[i:i + batch_size] for i in range(0, total, batch_size)]
     logger.info(f"Processing {total:,} docs in {len(batches):,} batches of ≤{batch_size}")
 
-    counters: dict = {'done': 0, 'errors': 0, 'rate_limits': 0, 'backoff_until': 0.0}
+    counters: dict = {'done': 0, 'errors': 0, 'rate_limits': 0, 'backoff_until': 0.0, 'input_tokens': 0}
     queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
 
     with open(output_path, 'a') as out_fh:
         worker_tasks = [
-            asyncio.create_task(worker(queue, client, out_fh, counters, input_field))
+            asyncio.create_task(worker(queue, client_ref, out_fh, counters, input_field, endpoint))
             for _ in range(concurrency)
         ]
         stats_task = asyncio.create_task(stats_loop(counters, total))
+        refresh_task = asyncio.create_task(token_refresh_loop(client_ref, endpoint))
 
         for batch in batches:
             await queue.put(batch)
@@ -237,10 +278,15 @@ async def run(cfg: dict, input_file: str, output_file: str, concurrency: int, en
 
         await asyncio.gather(*worker_tasks)
         stats_task.cancel()
+        refresh_task.cancel()
 
+    done = counters['done']
+    in_tok = counters['input_tokens']
     logger.info(
-        f"Complete — {counters['done']:,} embedded, {counters['errors']:,} errors | "
-        f"output: {output_path}"
+        f"Complete — {done:,} embedded, {counters['errors']:,} errors | output: {output_path}"
+    )
+    logger.info(
+        f"Tokens — input: {in_tok:,} ({in_tok // done if done else 0}/doc)"
     )
 
 
