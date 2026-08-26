@@ -1,12 +1,11 @@
 """
-Stage 4: Upload embeddings CSV into Azure Postgres with pgvector.
+Stage 4: Upload embeddings into Azure Postgres with pgvector.
 
-Reads a dated embeddings CSV (url, authority, title, year, summary, themes,
-document_text, embedding) and upserts each row into the target table.
-Skips rows already present by URL. Logs progress every 100 rows.
+Reads a JSONL or CSV file of embedded docs and upserts each row into the
+target table. Skips rows already present by URL. Logs progress every 100 rows.
 
 Usage:
-    python stages/04_upload.py --input data/embeddings_combined_08072026.csv
+    python stages/04_upload.py --input data/embeddings_gpt51_50k.jsonl --table ladi_gpt51
     python stages/04_upload.py --input data/embeddings_combined_08072026.csv --table embedding_sample
 """
 import argparse
@@ -107,8 +106,23 @@ def main():
         raise FileNotFoundError(f'Input file not found: {input_path}')
 
     log.info(f'Loading {input_path} → {args.table}')
-    df = pd.read_csv(input_path)
-    log.info(f'Read {len(df):,} rows from CSV')
+    if input_path.suffix == '.jsonl':
+        rows = []
+        with open(input_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        r = json.loads(line)
+                        if 'embedding' in r:
+                            rows.append(r)
+                    except json.JSONDecodeError:
+                        pass
+        df = pd.DataFrame(rows)
+        log.info(f'Read {len(df):,} rows from JSONL')
+    else:
+        df = pd.read_csv(input_path)
+        log.info(f'Read {len(df):,} rows from CSV')
 
     conn = get_connection()
     cur = conn.cursor()

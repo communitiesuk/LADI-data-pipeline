@@ -138,30 +138,32 @@ async def worker(
             queue.task_done()
             break
 
-        try:
-            results = await embed_batch(client, batch, input_field)
-            for r in results:
-                out_fh.write(json.dumps(r) + '\n')
-            out_fh.flush()
-            counters['done'] += len(results)
-        except Exception as e:
-            if "429" in str(e):
-                counters['rate_limits'] += 1
-                logger.warning("Rate limited — waiting 60s...")
-                await asyncio.sleep(60)
-                try:
-                    results = await embed_batch(client, batch, input_field)
-                    for r in results:
-                        out_fh.write(json.dumps(r) + '\n')
-                    out_fh.flush()
-                    counters['done'] += len(results)
-                except Exception as e2:
+        backoff = 60
+        while True:
+            wait = counters['backoff_until'] - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            try:
+                results = await embed_batch(client, batch, input_field)
+                for r in results:
+                    out_fh.write(json.dumps(r) + '\n')
+                out_fh.flush()
+                counters['done'] += len(results)
+                break
+            except Exception as e:
+                if "429" in str(e):
+                    counters['rate_limits'] += 1
+                    new_until = time.monotonic() + backoff
+                    if new_until > counters['backoff_until']:
+                        counters['backoff_until'] = new_until
+                        logger.warning(f"Rate limited — shared backoff {backoff}s")
+                    backoff = min(backoff * 2, 300)
+                else:
                     counters['errors'] += len(batch)
-                    logger.warning(f"Batch retry failed ({len(batch)} docs): {e2}")
-            else:
-                counters['errors'] += len(batch)
-                urls = [r.get('url', '')[:60] for r in batch[:3]]
-                logger.warning(f"Batch failed ({len(batch)} docs) {type(e).__name__}: {e} | urls: {urls}")
+                    urls = [r.get('url', '')[:60] for r in batch[:3]]
+                    logger.warning(f"Batch failed ({len(batch)} docs) {type(e).__name__}: {e} | urls: {urls}")
+                    break
 
         queue.task_done()
 
@@ -217,7 +219,7 @@ async def run(cfg: dict, input_file: str, output_file: str, concurrency: int, en
     batches = [records[i:i + batch_size] for i in range(0, total, batch_size)]
     logger.info(f"Processing {total:,} docs in {len(batches):,} batches of ≤{batch_size}")
 
-    counters: dict = {'done': 0, 'errors': 0, 'rate_limits': 0}
+    counters: dict = {'done': 0, 'errors': 0, 'rate_limits': 0, 'backoff_until': 0.0}
     queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
 
     with open(output_path, 'a') as out_fh:
