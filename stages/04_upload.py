@@ -36,6 +36,7 @@ COL_LIMITS = {
     'authority': 100,
     'year':      10,
     'themes':    250,
+    'doc_type':  100,
 }
 
 
@@ -69,13 +70,14 @@ def upsert_row(cur, table, row):
 
     cur.execute(
         f"""
-        INSERT INTO {table} (url, title, year, summary, themes, authority, text, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)
+        INSERT INTO {table} (url, title, year, summary, themes, doc_type, authority, text, embedding)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
         ON CONFLICT (url) DO UPDATE SET
             title     = EXCLUDED.title,
             year      = EXCLUDED.year,
             summary   = EXCLUDED.summary,
             themes    = EXCLUDED.themes,
+            doc_type  = EXCLUDED.doc_type,
             authority = EXCLUDED.authority,
             text      = EXCLUDED.text,
             embedding = EXCLUDED.embedding
@@ -86,6 +88,7 @@ def upsert_row(cur, table, row):
             truncate(str(row.get('year', '')), 10) if row.get('year') else None,
             row.get('summary'),
             truncate(str(row.get('themes', '')), 250),
+            truncate(str(row.get('doc_type', '')), 100) if row.get('doc_type') else None,
             truncate(row.get('authority'), 100),
             row.get('text') or row.get('document_text'),
             vec_str,

@@ -28,15 +28,50 @@ logger = logging.getLogger(__name__)
 
 MODEL = "text-embedding-3-large"
 
+EMBEDDING_ENDPOINTS = {
+    'sandbox': {
+        'base_url_env': 'LADI_APIM_EMBEDDING_URL',
+        'key_env': 'LADI_APIM_SUBSCRIPTION_KEY',
+        'api_version_env': 'LADI_APIM_API_VERSION',
+        'token_scope_env': 'LADI_APIM_TOKEN_SCOPE',
+        'use_ad_token': True,
+    },
+    'prod': {
+        'base_url_env': 'LADI_PROD_APIM_EMBEDDING_URL',
+        'key_env': 'LADI_PROD_APIM_KEY',
+        'api_version_env': 'LADI_PROD_APIM_API_VERSION',
+        'token_scope_env': 'LADI_PROD_APIM_TOKEN_SCOPE',
+        'use_ad_token': True,
+    },
+}
+
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def build_client() -> AsyncOpenAI:
-    from ladi.apim import build_embedding_client
-    return build_embedding_client()
+def build_client(endpoint: str = 'prod') -> AsyncOpenAI:
+    import os, subprocess, json as _json
+    cfg = EMBEDDING_ENDPOINTS[endpoint]
+    sub_key = os.environ[cfg['key_env']]
+    if cfg['use_ad_token']:
+        scope = os.environ[cfg['token_scope_env']]
+        result = subprocess.run(
+            ["az", "account", "get-access-token", "--scope", scope, "--output", "json"],
+            check=True, capture_output=True, text=True,
+        )
+        api_key = _json.loads(result.stdout)["accessToken"]
+    else:
+        api_key = sub_key
+    return AsyncOpenAI(
+        base_url=os.environ[cfg['base_url_env']],
+        api_key=api_key,
+        default_headers={"Ocp-Apim-Subscription-Key": sub_key},
+        default_query={"api-version": os.environ[cfg['api_version_env']]},
+        max_retries=0,
+        timeout=60.0,
+    )
 
 
 def load_checkpoint(output_path: Path) -> set:
@@ -151,7 +186,7 @@ async def stats_loop(counters: dict, total: int, interval: int = 60) -> None:
         pass
 
 
-async def run(cfg: dict, input_file: str, output_file: str, concurrency: int) -> None:
+async def run(cfg: dict, input_file: str, output_file: str, concurrency: int, endpoint: str = 'prod') -> None:
     embed_cfg = cfg.get('embed', {})
     input_field: str = embed_cfg.get('input_field', 'summary')
     batch_size: int = embed_cfg.get('batch_size', 100)
@@ -163,7 +198,7 @@ async def run(cfg: dict, input_file: str, output_file: str, concurrency: int) ->
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
 
-    client = build_client()
+    client = build_client(endpoint)
     done_urls = load_checkpoint(output_path)
 
     logger.info(f"Loading {input_path} ...")
@@ -218,13 +253,15 @@ def main():
                    help='Output JSONL path (default: from config embed.output_file)')
     p.add_argument('--concurrency', type=int, default=5,
                    help='Concurrent batch requests (default: 5)')
+    p.add_argument('--endpoint', default='prod', choices=list(EMBEDDING_ENDPOINTS),
+                   help='Embedding endpoint to use: prod (default) or sandbox')
     args = p.parse_args()
 
     cfg = load_config(args.config)
     input_file = args.input or cfg['summarise']['output_file']
     output_file = args.output or cfg['embed']['output_file']
 
-    asyncio.run(run(cfg, input_file, output_file, args.concurrency))
+    asyncio.run(run(cfg, input_file, output_file, args.concurrency, args.endpoint))
 
 
 if __name__ == '__main__':

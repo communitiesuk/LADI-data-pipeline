@@ -1,6 +1,11 @@
 # Secrets — never commit
 .env
 
+# OS / editor
+.DS_Store
+logs/
+*.xlsx
+
 # Data files
 *.csv
 *.jsonl
