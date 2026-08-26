@@ -318,13 +318,17 @@ async def worker(
                         logger.warning(f"Rate limited — shared backoff {backoff}s (will retry {url[:60]})")
                     backoff = min(backoff * 2, 300)
                 elif "401" in str(e) and profile.get('use_ad_token'):
-                    logger.warning("401 Unauthorized — refreshing AD token and retrying ...")
-                    try:
-                        client_ref['client'] = build_client(profile)
-                        logger.info("Token refreshed after 401.")
-                    except Exception as ref_e:
-                        logger.warning(f"Token refresh failed: {ref_e}")
-                    await asyncio.sleep(5)
+                    async with client_ref['lock']:
+                        if time.monotonic() - client_ref['last_refreshed'] > 10:
+                            logger.warning("401 Unauthorized — refreshing AD token ...")
+                            try:
+                                client_ref['client'] = build_client(profile)
+                                client_ref['last_refreshed'] = time.monotonic()
+                                logger.info("Token refreshed after 401.")
+                            except Exception as ref_e:
+                                logger.warning(f"Token refresh failed: {ref_e}")
+                        # else: another worker already refreshed, just retry
+                    await asyncio.sleep(1)
                     # falls through to retry the inner while loop
                 else:
                     counters['errors'] += 1
@@ -341,7 +345,9 @@ async def token_refresh_loop(client_ref: dict, profile: dict, interval: int = 27
             await asyncio.sleep(interval)
             try:
                 logger.info("Refreshing Azure AD token ...")
-                client_ref['client'] = build_client(profile)
+                async with client_ref['lock']:
+                    client_ref['client'] = build_client(profile)
+                    client_ref['last_refreshed'] = time.monotonic()
                 logger.info("Azure AD token refreshed successfully.")
             except Exception as e:
                 logger.warning(f"Token refresh failed: {e} — will retry next cycle")
@@ -388,7 +394,11 @@ async def run(cfg: dict, input_csv: str, output_file: str, concurrency: int, pro
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    client_ref = {'client': build_client(profile)}
+    client_ref = {
+        'client': build_client(profile),
+        'lock': asyncio.Lock(),
+        'last_refreshed': time.monotonic(),
+    }
     done_urls = load_checkpoint(output_path)
 
     logger.info(f"Loading {input_csv} ...")
