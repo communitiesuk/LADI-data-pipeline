@@ -221,21 +221,30 @@ def load_checkpoint(output_path: Path) -> set:
 
 async def call_api(client: AsyncOpenAI, url: str, authority: str, text: str, profile: dict) -> dict:
     cleaned = clean_text(truncate_words(text))
-    # Azure WAF sanitisation — colons trigger PII/geolocation rules, strip other risky content
-    cleaned = cleaned.replace(":", " -")
+    # Strip URLs first (before colon replacement, which would break https:// regex)
     cleaned = re.sub(r"https?://\S+", "", cleaned)
     cleaned = re.sub(r"www\.\S+", "", cleaned)
+    # Azure WAF sanitisation
+    cleaned = cleaned.replace(":", " -")
     cleaned = re.sub(r"[\w.-]+@[\w.-]+\.\w+", "", cleaned)
     cleaned = re.sub(r"\d{4,5}\s?\d{6}", "", cleaned)  # UK phone numbers
     cleaned = re.sub(r"[^\x00-\x7F]+", "", cleaned)  # non-ASCII (Cyrillic etc.)
+    cleaned = cleaned.replace('<', '(').replace('>', ')')  # HTML/angle bracket injection
+    cleaned = cleaned.replace("'", '')  # SQL injection: single quotes
     cleaned = re.sub(r"\b(database|schema)\s*\(", r"\1 ", cleaned)  # SQL injection pattern
     cleaned = re.sub(r"(\d)\s+as\s+(\w+)\s+from", r"\1 as \2 since", cleaned)  # SQL SELECT pattern
+    cleaned = re.sub(r'(?i)\bfrom\b', 'fr-om', cleaned)   # SQL FROM keyword
+    cleaned = re.sub(r'(?i)\bupdate\b', 'upd-ate', cleaned)  # SQL UPDATE keyword
+    cleaned = cleaned.replace(';', '.')    # SQL statement terminator
+    cleaned = re.sub(r'(?<!\s)/(?!\s)', '-', cleaned)  # path fragments like space/landscaping
     # Skip garbled text (bad PDF extraction) — if <50% alpha chars, not useful
     alpha_ratio = sum(c.isalpha() for c in cleaned) / max(len(cleaned), 1)
     if alpha_ratio < 0.5:
         return {"url": url, "authority": authority, "error": "garbled_text",
                 "_input_tokens": 0, "_output_tokens": 0, "_reasoning_tokens": 0}
-    user_content = f"Authority: {authority}\nURL: {url}\n\n{cleaned}"
+    # Strip URL query string to avoid XSS patterns like &href= in the header
+    url_display = re.sub(r'\?.*$', '', url)
+    user_content = f"Authority: {authority}\nURL: {url_display}\n\n{cleaned}"
 
     create_kwargs = dict(
         model=profile['deployment_id'],

@@ -61,6 +61,12 @@ def load_existing_urls(cur, table):
     return {row[0] for row in cur.fetchall()}
 
 
+def strip_nul(value):
+    if isinstance(value, str):
+        return value.replace('\x00', '')
+    return value
+
+
 def upsert_row(cur, table, row):
     embedding = row['embedding']
     if isinstance(embedding, str):
@@ -82,14 +88,14 @@ def upsert_row(cur, table, row):
             embedding = EXCLUDED.embedding
         """,
         (
-            truncate(row.get('url'), 250),
-            truncate(row.get('title'), 250),
+            truncate(strip_nul(row.get('url')), 250),
+            truncate(strip_nul(row.get('title')), 250),
             truncate(str(row.get('year', '')), 10) if row.get('year') else None,
-            row.get('summary'),
-            truncate(str(row.get('themes', '')), 250),
-            truncate(str(row.get('doc_type', '')), 100) if row.get('doc_type') else None,
-            truncate(row.get('authority'), 100),
-            row.get('text') or row.get('document_text'),
+            strip_nul(row.get('summary')),
+            truncate(strip_nul(str(row.get('themes', ''))), 250),
+            truncate(strip_nul(str(row.get('doc_type', ''))), 100) if row.get('doc_type') else None,
+            truncate(strip_nul(row.get('authority')), 100),
+            strip_nul(row.get('text') or row.get('document_text')),
             vec_str,
         ),
     )
@@ -99,11 +105,18 @@ def main():
     p = argparse.ArgumentParser(description='Load embeddings CSV into Postgres')
     p.add_argument('--input', required=True, help='Path to embeddings CSV')
     p.add_argument('--table', default=os.environ.get('LADI_DB_TABLE', 'embedding_sample'), help='Target table name')
+    p.add_argument('--urls-file', default=None, help='Optional file of URLs (one per line) to restrict upload to')
     args = p.parse_args()
 
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f'Input file not found: {input_path}')
+
+    filter_urls = None
+    if args.urls_file:
+        with open(args.urls_file) as f:
+            filter_urls = {line.strip() for line in f if line.strip()}
+        log.info(f'URL filter loaded: {len(filter_urls):,} URLs')
 
     log.info(f'Loading {input_path} → {args.table}')
     if input_path.suffix == '.jsonl':
@@ -115,14 +128,17 @@ def main():
                     try:
                         r = json.loads(line)
                         if 'embedding' in r:
-                            rows.append(r)
+                            if filter_urls is None or r.get('url') in filter_urls:
+                                rows.append(r)
                     except json.JSONDecodeError:
                         pass
         df = pd.DataFrame(rows)
-        log.info(f'Read {len(df):,} rows from JSONL')
+        log.info(f'Read {len(df):,} rows from JSONL (after URL filter)')
     else:
         df = pd.read_csv(input_path)
-        log.info(f'Read {len(df):,} rows from CSV')
+        if filter_urls is not None:
+            df = df[df['url'].isin(filter_urls)]
+        log.info(f'Read {len(df):,} rows from CSV (after URL filter)')
 
     conn = get_connection()
     cur = conn.cursor()
